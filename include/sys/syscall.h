@@ -26,5 +26,6 @@
 #define sys_mkdir 23
 #define sys_chdir 24
 #define sys_getcwd 25
+#define sys_getdents 26
 
 #endif

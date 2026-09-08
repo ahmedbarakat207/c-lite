@@ -10,13 +10,16 @@ struct dirent {
 
 typedef struct {
     int fd;
-    int index;
+    unsigned int index;   // byte offset into buf for next readdir() call 
+    unsigned int buflen;  // total valid bytes in buf
+    void *buf;            // flat kernel dirent buffer filled by sys_getdents
     char path[256];
     struct dirent entry;
 } DIR;
 
-DIR *opendir(const char *name);
+DIR           *opendir(const char *name);
 struct dirent *readdir(DIR *dirp);
-int closedir(DIR *dirp);
+void           rewinddir(DIR *dirp);
+int            closedir(DIR *dirp);
 
 #endif
