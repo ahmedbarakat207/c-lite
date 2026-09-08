@@ -39,7 +39,7 @@ int puts(const char *s) {
     return (int)len + 1;
 }
 
-static void format_num(char **out, size_t *rem, unsigned long val, int base, int uppercase, int width, char pad, int negative) {
+static void format_num(char **out, size_t *rem, unsigned long val, int base, int uppercase, int width, char pad, int negative, int left_align) {
     char buf[32];
     int i = 0;
     const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -58,6 +58,23 @@ static void format_num(char **out, size_t *rem, unsigned long val, int base, int
     }
 
     int pad_count = (width > i) ? (width - i) : 0;
+
+    if (left_align) {
+        while (i-- > 0) {
+            if (*rem > 1) {
+                *(*out)++ = buf[i];
+                (*rem)--;
+            }
+        }
+        while (pad_count-- > 0) {
+            if (*rem > 1) {
+                *(*out)++ = ' ';
+                (*rem)--;
+            }
+        }
+        return;
+    }
+
     if (pad == '0' && negative) {
         if (*rem > 1) {
             *(*out)++ = '-';
@@ -105,37 +122,65 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
             continue;
         }
 
-        // padding
+        // flags
+        int left_align = 0;
         char pad = ' ';
-        if (*format == '0') {
-            pad = '0';
+        while (*format == '-' || *format == '0' || *format == '+' || *format == ' ' || *format == '#') {
+            if (*format == '-') left_align = 1;
+            else if (*format == '0') pad = '0';
             format++;
         }
+        if (left_align) pad = ' ';
 
         // width
         int width = 0;
-        while (*format >= '0' && *format <= '9') {
-            width = width * 10 + (*format - '0');
+        if (*format == '*') {
+            width = va_arg(ap, int);
+            if (width < 0) {
+                left_align = 1;
+                width = -width;
+            }
             format++;
-        }
-
-        // length
-        int is_long = 0;
-        if (*format == 'l') {
-            is_long = 1;
-            format++;
-            if (*format == 'l') {
-                is_long = 2;
+        } else {
+            while (*format >= '0' && *format <= '9') {
+                width = width * 10 + (*format - '0');
                 format++;
             }
+        }
+
+        // precision
+        int precision = -1;
+        if (*format == '.') {
+            format++;
+            if (*format == '*') {
+                precision = va_arg(ap, int);
+                format++;
+            } else {
+                precision = 0;
+                while (*format >= '0' && *format <= '9') {
+                    precision = precision * 10 + (*format - '0');
+                    format++;
+                }
+            }
+        }
+
+        // length modifiers
+        int is_long = 0;
+        while (*format == 'l' || *format == 'h' || *format == 'z' || *format == 'j' || *format == 't') {
+            if (*format == 'l') is_long++;
+            format++;
         }
 
         switch (*format) {
             case 'c': {
                 char c = (char)va_arg(ap, int);
-                if (rem > 1) {
-                    *out++ = c;
-                    rem--;
+                int pad_count = (width > 1) ? (width - 1) : 0;
+                if (!left_align) {
+                    while (pad_count-- > 0 && rem > 1) { *out++ = ' '; rem--; }
+                }
+                if (rem > 1) { *out++ = c; rem--; }
+                if (left_align) {
+                    while (pad_count-- > 0 && rem > 1) { *out++ = ' '; rem--; }
                 }
                 break;
             }
@@ -143,14 +188,25 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
                 const char *s = va_arg(ap, const char*);
                 if (!s) s = "(null)";
                 size_t slen = strlen(s);
+                if (precision >= 0 && slen > (size_t)precision) {
+                    slen = (size_t)precision;
+                }
                 int pad_count = (width > (int)slen) ? (width - (int)slen) : 0;
-                while (pad_count-- > 0 && rem > 1) {
-                    *out++ = ' ';
+                if (!left_align) {
+                    while (pad_count-- > 0 && rem > 1) {
+                        *out++ = ' ';
+                        rem--;
+                    }
+                }
+                for (size_t i = 0; i < slen && rem > 1; i++) {
+                    *out++ = s[i];
                     rem--;
                 }
-                while (*s && rem > 1) {
-                    *out++ = *s++;
-                    rem--;
+                if (left_align) {
+                    while (pad_count-- > 0 && rem > 1) {
+                        *out++ = ' ';
+                        rem--;
+                    }
                 }
                 break;
             }
@@ -165,27 +221,27 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
                 } else {
                     uval = (unsigned long)val;
                 }
-                format_num(&out, &rem, uval, 10, 0, width, pad, negative);
+                format_num(&out, &rem, uval, 10, 0, width, pad, negative, left_align);
                 break;
             }
             case 'u': {
                 unsigned long val = is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
-                format_num(&out, &rem, val, 10, 0, width, pad, 0);
+                format_num(&out, &rem, val, 10, 0, width, pad, 0, left_align);
                 break;
             }
             case 'x': {
                 unsigned long val = is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
-                format_num(&out, &rem, val, 16, 0, width, pad, 0);
+                format_num(&out, &rem, val, 16, 0, width, pad, 0, left_align);
                 break;
             }
             case 'X': {
                 unsigned long val = is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
-                format_num(&out, &rem, val, 16, 1, width, pad, 0);
+                format_num(&out, &rem, val, 16, 1, width, pad, 0, left_align);
                 break;
             }
             case 'o': {
                 unsigned long val = is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
-                format_num(&out, &rem, val, 8, 0, width, pad, 0);
+                format_num(&out, &rem, val, 8, 0, width, pad, 0, left_align);
                 break;
             }
             case 'p': {
@@ -195,7 +251,7 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
                     *out++ = 'x';
                     rem -= 2;
                 }
-                format_num(&out, &rem, (uintptr_t)ptr, 16, 0, sizeof(uintptr_t) * 2, '0', 0);
+                format_num(&out, &rem, (uintptr_t)ptr, 16, 0, sizeof(uintptr_t) * 2, '0', 0, 0);
                 break;
             }
             default:

@@ -189,7 +189,11 @@ int fstat(int fd, struct stat *buf) {
 
 // sys_unlink
 int unlink(const char *path) {
-    return (int)syscall(sys_unlink, (long)path, 0, 0);
+    int ret = (int)syscall(sys_unlink, (long)path, 0, 0);
+    if (ret < 0) {
+        errno = ENOENT;
+    }
+    return ret;
 }
 
 int rmdir(const char *path) {
@@ -198,18 +202,27 @@ int rmdir(const char *path) {
 
 // sys_mkdir
 int mkdir(const char *path, mode_t mode) {
-    return (int)syscall(sys_mkdir, (long)path, mode, 0);
+    int ret = (int)syscall(sys_mkdir, (long)path, mode, 0);
+    if (ret < 0) {
+        errno = EEXIST;
+    }
+    return ret;
 }
 
 // sys_chdir
 int chdir(const char *path) {
-    return (int)syscall(sys_chdir, (long)path, 0, 0);
+    int ret = (int)syscall(sys_chdir, (long)path, 0, 0);
+    if (ret < 0) {
+        errno = ENOENT;
+    }
+    return ret;
 }
 
 // sys_getcwd
 char *getcwd(char *buf, size_t size) {
     int ret = (int)syscall(sys_getcwd, (long)buf, size, 0);
     if (ret < 0) {
+        errno = ENOENT;
         return NULL;
     }
     return buf;
