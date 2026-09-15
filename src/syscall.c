@@ -6,6 +6,7 @@
 #include "../include/sys/stat.h"
 #include "../include/sys/time.h"
 #include "../include/sys/socket.h"
+#include "../include/fcntl.h"
 #include "../include/unistd.h"
 #include "../include/string.h"
 #include "../include/time.h"
@@ -175,6 +176,10 @@ off_t lseek(int fd, off_t offset, int whence) {
 
 // sys_stat
 int stat(const char *path, struct stat *buf) {
+    if (buf) {
+        unsigned char *p = (unsigned char*)buf;
+        for (unsigned int i = 0; i < sizeof(*buf); i++) p[i] = 0;
+    }
     int ret = (int)syscall(sys_stat, (long)path, (long)buf, 0);
     if (ret < 0) {
         errno = ENOENT;
@@ -184,6 +189,10 @@ int stat(const char *path, struct stat *buf) {
 
 // sys_fstat
 int fstat(int fd, struct stat *buf) {
+    if (buf) {
+        unsigned char *p = (unsigned char*)buf;
+        for (unsigned int i = 0; i < sizeof(*buf); i++) p[i] = 0;
+    }
     return (int)syscall(sys_fstat, fd, (long)buf, 0);
 }
 
@@ -197,7 +206,11 @@ int unlink(const char *path) {
 }
 
 int rmdir(const char *path) {
-    return unlink(path);
+    int ret = (int)syscall(sys_rmdir, (long)path, 0, 0);
+    if (ret < 0) {
+        errno = ENOENT;
+    }
+    return ret;
 }
 
 // sys_mkdir
@@ -228,6 +241,22 @@ char *getcwd(char *buf, size_t size) {
     return buf;
 }
 
+// sys_ftruncate
+int ftruncate(int fd, off_t length) {
+    return (int)syscall(sys_ftruncate, fd, length, 0);
+}
+
+int truncate(const char *path, off_t length) {
+    int ret = (int)syscall(sys_truncate, (long)path, length, 0);
+    if (ret == 0) return 0;
+    // fallback for old kernels: open + ftruncate
+    int fd = open(path, O_WRONLY, 0);
+    if (fd < 0) return -1;
+    ret = ftruncate(fd, length);
+    close(fd);
+    return ret;
+}
+
 pid_t vfork(void) {
     return fork();
 }
@@ -237,13 +266,32 @@ int isatty(int fd) {
 }
 
 int access(const char *pathname, int mode) {
-    (void)mode;
-    struct stat st;
-    return stat(pathname, &st);
+    int ret = (int)syscall(sys_access, (long)pathname, mode, 0);
+    if (ret == 0) return 0;
+    // fallback for old kernels: stat probe
+    if (ret < 0) {
+        struct stat st;
+        if (stat(pathname, &st) == 0) return 0;
+    }
+    return -1;
 }
 
 int lstat(const char *path, struct stat *buf) {
+    if (buf) {
+        unsigned char *p = (unsigned char*)buf;
+        for (unsigned int i = 0; i < sizeof(*buf); i++) p[i] = 0;
+    }
+    int ret = (int)syscall(sys_lstat, (long)path, (long)buf, 0);
+    if (ret == 0) return 0;
     return stat(path, buf);
+}
+
+int rename(const char *oldpath, const char *newpath) {
+    int ret = (int)syscall(sys_rename, (long)oldpath, (long)newpath, 0);
+    if (ret < 0) {
+        errno = ENOENT;
+    }
+    return ret;
 }
 
 mode_t umask(mode_t mask) {
@@ -292,34 +340,90 @@ int lchown(const char *pathname, uid_t owner, gid_t group) {
 }
 
 int utimes(const char *filename, const struct timeval times[2]) {
-    (void)filename;
-    (void)times;
+    struct timespec ts[2];
+    const struct timespec *tp = NULL;
+    if (times) {
+        for (int i = 0; i < 2; i++) {
+            ts[i].tv_sec = times[i].tv_sec;
+            ts[i].tv_nsec = times[i].tv_usec * 1000;
+        }
+        tp = ts;
+    }
+    int ret = (int)syscall(sys_utimens, (long)filename, (long)tp, 0);
+    if (ret == 0) return 0;
+    // old kernel without utimens: no timestamps, pretend success
     return 0;
 }
 
 int lutimes(const char *filename, const struct timeval times[2]) {
-    (void)filename;
-    (void)times;
+    struct timespec ts[2];
+    const struct timespec *tp = NULL;
+    if (times) {
+        for (int i = 0; i < 2; i++) {
+            ts[i].tv_sec = times[i].tv_sec;
+            ts[i].tv_nsec = times[i].tv_usec * 1000;
+        }
+        tp = ts;
+    }
+    int ret = (int)syscall(sys_utimens, (long)filename, (long)tp, AT_SYMLINK_NOFOLLOW);
+    if (ret == 0) return 0;
     return 0;
 }
 
-int link(const char *oldpath, const char *newpath) {
-    (void)oldpath;
-    (void)newpath;
+int futimens(int fd, const struct timespec times[2]) {
+    int ret = (int)syscall(sys_futimens, fd, (long)times, 0);
+    if (ret == 0) return 0;
+    // old kernel without futimens: succeed iff the fd is a real file
+    {
+        struct stat st;
+        extern int fstat(int fd, struct stat *buf);
+        if (fstat(fd, &st) == 0) return 0;
+    }
+    errno = EBADF;
     return -1;
+}
+
+int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
+    (void)dirfd; // always AT_FDCWD: paths resolve against the cwd
+    if (flags != 0 && flags != AT_SYMLINK_NOFOLLOW) {
+        errno = EINVAL;
+        return -1;
+    }
+    int ret = (int)syscall(sys_utimens, (long)pathname, (long)times, flags);
+    if (ret == 0) return 0;
+    // old kernel without utimens: succeed iff the file exists so touch
+    // knows whether to create it
+    if (!pathname) {
+        errno = ENOENT;
+        return -1;
+    }
+    {
+        struct stat st;
+        int ok;
+        if (flags & AT_SYMLINK_NOFOLLOW) ok = lstat(pathname, &st);
+        else ok = stat(pathname, &st);
+        if (ok == 0) return 0;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+int link(const char *oldpath, const char *newpath) {
+    int ret = (int)syscall(sys_link, (long)oldpath, (long)newpath, 0);
+    if (ret < 0) errno = ENOENT;
+    return ret;
 }
 
 int symlink(const char *target, const char *linkpath) {
-    (void)target;
-    (void)linkpath;
-    return -1;
+    int ret = (int)syscall(sys_symlink, (long)target, (long)linkpath, 0);
+    if (ret < 0) errno = ENOENT;
+    return ret;
 }
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
-    (void)pathname;
-    (void)buf;
-    (void)bufsiz;
-    return -1;
+    int ret = (int)syscall(sys_readlink, (long)pathname, (long)buf, bufsiz);
+    if (ret < 0) errno = ENOENT;
+    return ret;
 }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {

@@ -27,5 +27,18 @@
 #define sys_chdir 24
 #define sys_getcwd 25
 #define sys_getdents 26
+#define sys_ftruncate 27
+#define sys_poll 28
+#define sys_uname 29
+#define sys_rename 30
+#define sys_rmdir 31
+#define sys_symlink 32
+#define sys_readlink 33
+#define sys_lstat 34
+#define sys_truncate 35
+#define sys_access 36
+#define sys_link 37
+#define sys_futimens 38
+#define sys_utimens 39
 
 #endif

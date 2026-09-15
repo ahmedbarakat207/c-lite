@@ -17,6 +17,9 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -436,19 +439,29 @@ int sigwait(const sigset_t *set, int *sig) {
 /* ============ termios ============ */
 
 int tcgetattr(int fd, struct termios *termios_p) {
-    (void)fd;
     if (!termios_p) { errno = EINVAL; return -1; }
+    if (ioctl(fd, TCGETS, termios_p) == 0) return 0;
+    /* not a tty (or old kernel): report a sane cooked default */
     memset(termios_p, 0, sizeof(*termios_p));
+    termios_p->c_lflag = ICANON | ECHO;
+    termios_p->c_cc[VMIN] = 1;
     return 0;
 }
 
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {
-    (void)fd; (void)optional_actions; (void)termios_p;
-    return 0;
+    unsigned long req;
+    if (!termios_p) { errno = EINVAL; return -1; }
+    switch (optional_actions) {
+        case TCSADRAIN: req = TCSETSW; break;
+        case TCSAFLUSH: req = TCSETSF; break;
+        default: req = TCSETS; break;
+    }
+    return ioctl(fd, req, (void*)termios_p);
 }
 
 int tcflush(int fd, int queue_selector) {
-    (void)fd; (void)queue_selector;
+    (void)queue_selector;
+    if (ioctl(fd, TCFLSH, 0) == 0) return 0;
     return 0;
 }
 
@@ -712,9 +725,10 @@ int inet_pton(int af, const char *src, void *dst) {
 /* ============ poll/select ============ */
 
 int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-    (void)timeout;
+    long r = syscall(sys_poll, (long)fds, (long)nfds, (long)timeout);
+    if (r >= 0) return (int)r;
+    /* pre-poll kernel: pretend all fds are ready; avoids blocking forever in shell */
     if (!fds) { errno = EFAULT; return -1; }
-    /* pretend all fds are ready; avoids blocking forever in shell */
     for (nfds_t i = 0; i < nfds; i++) {
         fds[i].revents = fds[i].events & (POLLIN | POLLOUT);
         if (fds[i].revents == 0) fds[i].revents = POLLIN;
@@ -795,17 +809,17 @@ int clearenv(void) {
     return 0;
 }
 
-int uname(void *buf) {
-    (void)buf;
-    errno = ENOSYS;
-    return -1;
-}
-
-int rename(const char *oldpath, const char *newpath) {
-    (void)oldpath;
-    (void)newpath;
-    errno = ENOSYS;
-    return -1;
+int uname(struct utsname *buf) {
+    if (!buf) { errno = EFAULT; return -1; }
+    if ((long)syscall(sys_uname, (long)buf, 0, 0) == 0) return 0;
+    /* pre-uname kernel: report static defaults instead of failing */
+    memset(buf, 0, sizeof(*buf));
+    strcpy(buf->sysname, "LiteBSD");
+    strcpy(buf->nodename, "litebsd");
+    strcpy(buf->release, "1.0");
+    strcpy(buf->version, "LiteBSD i386");
+    strcpy(buf->machine, "i386");
+    return 0;
 }
 
 int settimeofday(const struct timeval *tv, const struct timezone *tz) {
@@ -980,4 +994,36 @@ int sscanf(const char *str, const char *format, ...) {
     int ret = vsscanf(str, format, ap);
     va_end(ap);
     return ret;
+}
+
+char *dirname(char *path) {
+    static char buf[1024];
+    if (!path || !*path) return ".";
+    size_t len = strlen(path);
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, path, len);
+    buf[len] = '\0';
+    // strip trailing slashes
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+    char *last = strrchr(buf, '/');
+    if (!last) return ".";
+    if (last == buf) return "/";
+    *last = '\0';
+    return buf;
+}
+
+char *basename(char *path) {
+    static char buf[1024];
+    if (!path || !*path) return ".";
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    const char *end = path + len;
+    const char *start = end;
+    while (start > path && *(start - 1) != '/') start--;
+    size_t n = (size_t)(end - start);
+    if (n == 0) return "/";
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, start, n);
+    buf[n] = '\0';
+    return buf;
 }

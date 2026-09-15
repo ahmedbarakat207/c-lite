@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include <time.h>
 
 #define S_IFMT   00170000
 #define S_IFSOCK 0140000
@@ -49,10 +50,24 @@ struct stat {
     dev_t    st_rdev;
     blksize_t st_blksize;
     blkcnt_t st_blocks;
-    time_t   st_atime;
-    time_t   st_mtime;
-    time_t   st_ctime;
+    // both spellings share storage; offsets must match the kernel struct
+    // (sec/nsec at 40/44, 48/52, 56/60).
+    union { time_t st_atime; struct timespec st_atim; };
+    union { time_t st_mtime; struct timespec st_mtim; };
+    union { time_t st_ctime; struct timespec st_ctim; };
 };
+
+#define AT_FDCWD (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR 0x200
+#define AT_SYMLINK_FOLLOW 0x400
+#define AT_EMPTY_PATH 0x1000
+
+#define UTIME_NOW ((1L << 30) - 1L)
+#define UTIME_OMIT ((1L << 30) - 2L)
+
+int futimens(int fd, const struct timespec times[2]);
+int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);
 
 int stat(const char *path, struct stat *buf);
 int fstat(int fd, struct stat *buf);
