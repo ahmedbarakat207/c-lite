@@ -6,8 +6,8 @@ BUILD_DIR := build
 SRC_DIR := src
 INC_DIR := include
 
-CFLAGS := -std=gnu11 -ffreestanding -O2 -Wall -Wextra -m32 \
-	-fno-pie -fno-stack-protector -fno-builtin -I $(INC_DIR)
+CFLAGS := -std=gnu11 -ffreestanding -Os -Wall -Wextra -m32 \
+	-fno-pie -fno-stack-protector -fno-builtin -ffunction-sections -fdata-sections -I $(INC_DIR)
 
 C_SRCS := $(SRC_DIR)/syscall.c \
           $(SRC_DIR)/string.c \
