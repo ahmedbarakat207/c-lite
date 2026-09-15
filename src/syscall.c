@@ -66,8 +66,11 @@ pid_t fork(void) {
 
 // sys_execve
 int execve(const char *path, char *const argv[], char *const envp[]) {
-    return (int)syscall(sys_execve, (long)path, (long)argv, (long)envp);
+    int ret = (int)syscall(sys_execve, (long)path, (long)argv, (long)envp);
+    if (ret < 0) errno = ENOENT;
+    return ret;
 }
+
 
 // sys_wait4
 pid_t wait4(pid_t pid, int *status, int options, void *rusage) {
@@ -470,27 +473,39 @@ unsigned int alarm(unsigned int seconds) {
 extern char **environ;
 
 int execvp(const char *file, char *const argv[]) {
-    if (!file || !*file) return -1;
+    if (!file || !*file) { errno = ENOENT; return -1; }
+    // absolute or relative path: exec directly
     if (strchr(file, '/')) {
-        return execve(file, argv, environ);
+        int r = execve(file, argv, environ);
+        if (r < 0) errno = ENOENT;
+        return r;
     }
-    char path[256];
-    // try /bin/file
+    const char *path_env = getenv("PATH");
+    if (!path_env) path_env = "/bin:/sbin:/usr/bin:/usr/sbin";
     size_t flen = strlen(file);
-    if (flen + 6 < sizeof(path)) {
-        memcpy(path, "/bin/", 5);
-        memcpy(path + 5, file, flen + 1);
-        if (access(path, 0) == 0) {
-            return execve(path, argv, environ);
+    char buf[256];
+    const char *p = path_env;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != ':') end++;
+        size_t dlen = (size_t)(end - p);
+        if (dlen + flen + 2 < sizeof(buf)) {
+            if (dlen == 0) {
+                buf[0] = '.'; buf[1] = '/';
+                memcpy(buf + 2, file, flen + 1);
+            } else {
+                memcpy(buf, p, dlen);
+                buf[dlen] = '/';
+                memcpy(buf + dlen + 1, file, flen + 1);
+            }
+            // probe with access() before exec: execve does a full kernel
+            // arg-copy/free cycle on failure which churns the shared heap
+            if (access(buf, 0) == 0)
+                return execve(buf, argv, environ);
         }
+        p = (*end == ':') ? end + 1 : end;
     }
-    // try /file
-    if (flen + 2 < sizeof(path)) {
-        path[0] = '/';
-        memcpy(path + 1, file, flen + 1);
-        if (access(path, 0) == 0) {
-            return execve(path, argv, environ);
-        }
-    }
-    return execve(file, argv, environ);
+    errno = ENOENT;
+    return -1;
 }
+

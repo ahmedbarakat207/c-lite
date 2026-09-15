@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -820,6 +821,97 @@ int uname(struct utsname *buf) {
     strcpy(buf->release, "1.0");
     strcpy(buf->version, "LiteBSD i386");
     strcpy(buf->machine, "i386");
+    return 0;
+}
+
+/* read a whole small file (up to 2047 bytes) into buf, NUL-terminated.
+ * returns bytes read or -1. */
+static int read_file_to_buf(const char *path, char *buf) {
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return -1;
+    int total = 0;
+    while (total < 2047) {
+        int n = read(fd, buf + total, 2047 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+    buf[total] = '\0';
+    return total;
+}
+
+/* parse "12.34" style load into 16.16 fixed point (Linux LOAD format) */
+static unsigned long parse_load(const char **pp) {
+    const char *p = *pp;
+    unsigned long val = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10 + (unsigned long)(*p - '0');
+        p++;
+    }
+    val *= 65536UL;
+    if (*p == '.') {
+        unsigned long frac = 0;
+        unsigned long scale = 65536UL / 10;
+        p++;
+        while (*p >= '0' && *p <= '9' && scale > 0) {
+            frac += (unsigned long)(*p - '0') * scale;
+            scale /= 10;
+            p++;
+        }
+        val += frac;
+    }
+    *pp = p;
+    return val;
+}
+
+int sysinfo(struct sysinfo *info) {
+    char buf[2048];
+    if (!info) {
+        errno = EFAULT;
+        return -1;
+    }
+    memset(info, 0, sizeof(*info));
+    info->mem_unit = 1;
+    if (read_file_to_buf("/proc/uptime", buf) > 0) {
+        long up = 0;
+        sscanf(buf, "%ld", &up);
+        if (up > 0) info->uptime = up;
+    }
+    if (read_file_to_buf("/proc/loadavg", buf) > 0) {
+        const char *p = buf;
+        info->loads[0] = parse_load(&p);
+        info->loads[1] = parse_load(&p);
+        info->loads[2] = parse_load(&p);
+    }
+    if (read_file_to_buf("/proc/meminfo", buf) > 0) {
+        char *line = buf;
+        while (line && *line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            {
+                unsigned long v = 0;
+                if (sscanf(line, "MemTotal: %lu", &v) == 1)
+                    info->totalram = v * 1024;
+                else if (sscanf(line, "MemFree: %lu", &v) == 1)
+                    info->freeram = v * 1024;
+            }
+            if (!nl) break;
+            line = nl + 1;
+        }
+    }
+    {
+        DIR *dp = opendir("/proc");
+        if (dp) {
+            struct dirent *de;
+            unsigned short n = 0;
+            while ((de = readdir(dp)) != NULL) {
+                if (de->d_name[0] >= '0' && de->d_name[0] <= '9') n++;
+            }
+            closedir(dp);
+            info->procs = n;
+        }
+    }
     return 0;
 }
 
