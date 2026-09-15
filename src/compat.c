@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <locale.h>
 #include <glob.h>
+#include <fnmatch.h>
 #include <ctype.h>
 
 extern long syscall(long number, ...);
@@ -828,15 +829,299 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz) {
     return 0;
 }
 
+#define GLOB_MAX_MATCHES 1024
+#define GLOB_MAX_COMPONENTS 64
+
+struct glob_vec {
+    char **v;
+    size_t n;
+    size_t cap;
+};
+
+static void glob_vec_free(struct glob_vec *sv) {
+    if (!sv || !sv->v) return;
+    for (size_t i = 0; i < sv->n; i++) free(sv->v[i]);
+    free(sv->v);
+    sv->v = NULL;
+    sv->n = sv->cap = 0;
+}
+
+static int glob_vec_push(struct glob_vec *sv, const char *s) {
+    if (sv->n >= GLOB_MAX_MATCHES) return -1;
+    if (sv->n + 1 > sv->cap) {
+        size_t ncap = sv->cap ? sv->cap * 2 : 16;
+        char **nv = (char **)realloc(sv->v, ncap * sizeof(*nv));
+        if (!nv) return -1;
+        sv->v = nv;
+        sv->cap = ncap;
+    }
+    char *c = strdup(s);
+    if (!c) return -1;
+    sv->v[sv->n++] = c;
+    return 0;
+}
+
+static int glob_has_meta(const char *s, int noescape) {
+    for (; *s; s++) {
+        if (*s == '\\' && !noescape && s[1]) {
+            s++;
+            continue;
+        }
+        if (*s == '*' || *s == '?' || *s == '[') return 1;
+    }
+    return 0;
+}
+
+// strip backslash escapes ("\\x" -> "x") unless NOESCAPE
+static void glob_unescape_to(const char *src, char *dst, int noescape) {
+    while (*src) {
+        if (*src == '\\' && !noescape && src[1]) src++;
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static int glob_is_dir(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// join dir + name into out (1024). "" means cwd-relative bare name.
+static int glob_join(char *out, const char *dir, const char *name) {
+    size_t dl = strlen(dir);
+    size_t nl = strlen(name);
+    size_t need;
+    if (dl == 0) {
+        need = nl + 1;
+        if (need > 1024) return -1;
+        strcpy(out, name);
+    } else if (dl == 1 && dir[0] == '/') {
+        need = 1 + nl + 1;
+        if (need > 1024) return -1;
+        out[0] = '/';
+        strcpy(out + 1, name);
+    } else {
+        need = dl + 1 + nl + 1;
+        if (need > 1024) return -1;
+        strcpy(out, dir);
+        out[dl] = '/';
+        strcpy(out + dl + 1, name);
+    }
+    return 0;
+}
+
 int glob(const char *pattern, int flags, int (*errfunc)(const char *epath, int eerrno), glob_t *pglob) {
-    (void)flags;
     (void)errfunc;
     if (!pattern || !pglob) return GLOB_ABORTED;
-    pglob->gl_pathc = 1;
-    pglob->gl_pathv = (char **)malloc(2 * sizeof(char *));
-    if (!pglob->gl_pathv) return GLOB_NOSPACE;
-    pglob->gl_pathv[0] = strdup(pattern);
-    pglob->gl_pathv[1] = NULL;
+    int noescape = (flags & GLOB_NOESCAPE) != 0;
+    int fnflags = FNM_PERIOD;
+    if (noescape) fnflags |= FNM_NOESCAPE;
+    if (flags & GLOB_PERIOD) fnflags &= ~FNM_PERIOD;
+    int markdirs = (flags & (GLOB_MARK | GLOB_ONLYDIR)) != 0;
+    int onlydir = (flags & GLOB_ONLYDIR) != 0;
+
+    struct glob_vec out = { NULL, 0, 0 };
+    int ret = 0;
+
+    // seed with existing results for GLOB_APPEND
+    if ((flags & GLOB_APPEND) && pglob->gl_pathv) {
+        for (size_t i = 0; i < pglob->gl_pathc; i++) {
+            if (pglob->gl_pathv[i] && glob_vec_push(&out, pglob->gl_pathv[i]) != 0) {
+                ret = GLOB_NOSPACE;
+                goto done;
+            }
+        }
+    }
+
+    if (!glob_has_meta(pattern, noescape)) {
+        // literal pattern: returned as-is (backslashes stripped)
+        char lit[1024];
+        glob_unescape_to(pattern, lit, noescape);
+        if (glob_vec_push(&out, lit) != 0) {
+            ret = GLOB_NOSPACE;
+            goto done;
+        }
+    } else {
+        // split into components on unescaped '/'
+        char buf[1024];
+        size_t pl = strlen(pattern);
+        if (pl >= sizeof(buf)) {
+            ret = GLOB_NOMATCH;
+            goto done;
+        }
+        strcpy(buf, pattern);
+        const char *comp[GLOB_MAX_COMPONENTS];
+        int ncomp = 0;
+        {
+            char *p = buf;
+            char *start = p;
+            while (*p && ncomp < GLOB_MAX_COMPONENTS) {
+                if (*p == '\\' && !noescape && p[1]) {
+                    p += 2;
+                    continue;
+                }
+                if (*p == '/') {
+                    *p = '\0';
+                    // keep the (possibly empty) first component as the root
+                    // marker for absolute patterns; drop other empties from
+                    // doubled slashes
+                    if (ncomp == 0 || start != p) comp[ncomp++] = start;
+                    start = p + 1;
+                }
+                p++;
+            }
+            if (ncomp < GLOB_MAX_COMPONENTS) comp[ncomp++] = start;
+        }
+        int absolute = pattern[0] == '/';
+        // trailing '/' (unescaped) constrains matches to directories
+        int trailing_slash = 0;
+        if (pl > 1 && pattern[pl - 1] == '/') {
+            size_t bs = 0;
+            while (!noescape && bs + 2 <= pl && pattern[pl - 2 - bs] == '\\') bs++;
+            trailing_slash = (bs % 2 == 0);
+        }
+
+        struct glob_vec cur = { NULL, 0, 0 };
+        struct glob_vec next = { NULL, 0, 0 };
+        if (absolute) {
+            if (glob_vec_push(&cur, "/") != 0) {
+                ret = GLOB_NOSPACE;
+                goto done;
+            }
+        } else {
+            if (glob_vec_push(&cur, "") != 0) {
+                ret = GLOB_NOSPACE;
+                goto done;
+            }
+        }
+
+        for (int ci = 0; ci < ncomp && ret == 0; ci++) {
+            // skip the root marker (empty first component of absolute path)
+            if (ci == 0 && absolute && comp[ci][0] == '\0') continue;
+            // skip trailing empty from "d/" (handled via trailing_slash)
+            if (comp[ci][0] == '\0') continue;
+            int last = (ci == ncomp - 1);
+            // a trailing slash makes the scan behave as if one more
+            // (empty) level follows; trailing_slash enforces dir-only below
+            if (glob_has_meta(comp[ci], noescape)) {
+                for (size_t k = 0; k < cur.n && ret == 0; k++) {
+                    const char *dir = cur.v[k];
+                    DIR *dp = opendir(dir[0] ? dir : ".");
+                    if (!dp) continue;
+                    struct dirent *de;
+                    while ((de = readdir(dp)) != NULL) {
+                        if (de->d_name[0] == '.' &&
+                            (de->d_name[1] == '\0' ||
+                             (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                            continue; // never match . or ..
+                        if (fnmatch(comp[ci], de->d_name, fnflags) != 0)
+                            continue;
+                        char joined[1024];
+                        if (glob_join(joined, dir, de->d_name) != 0) continue;
+                        if (!last || !(trailing_slash || onlydir) ||
+                            glob_is_dir(joined)) {
+                            char final[1024];
+                            strcpy(final, joined);
+                            if (last && markdirs && glob_is_dir(joined)) {
+                                size_t fl = strlen(final);
+                                if (fl + 2 <= sizeof(final)) {
+                                    final[fl] = '/';
+                                    final[fl + 1] = '\0';
+                                }
+                            }
+                            if (glob_vec_push(&next, final) != 0) {
+                                ret = GLOB_NOSPACE;
+                                break;
+                            }
+                        }
+                    }
+                    closedir(dp);
+                }
+            } else {
+                char lit[1024];
+                glob_unescape_to(comp[ci], lit, noescape);
+                for (size_t k = 0; k < cur.n && ret == 0; k++) {
+                    char joined[1024];
+                    if (glob_join(joined, cur.v[k], lit) != 0) continue;
+                    if (!last) {
+                        if (!glob_is_dir(joined)) continue;
+                    } else {
+                        struct stat st;
+                        if (lstat(joined, &st) != 0) continue;
+                        if ((trailing_slash || onlydir) && !S_ISDIR(st.st_mode))
+                            continue;
+                        if (markdirs && S_ISDIR(st.st_mode)) {
+                            size_t jl = strlen(joined);
+                            if (jl + 2 > sizeof(joined)) continue;
+                            joined[jl] = '/';
+                            joined[jl + 1] = '\0';
+                        }
+                    }
+                    if (glob_vec_push(&next, joined) != 0) {
+                        ret = GLOB_NOSPACE;
+                        break;
+                    }
+                }
+            }
+            glob_vec_free(&cur);
+            cur = next;
+            next.v = NULL;
+            next.n = next.cap = 0;
+            if (cur.n == 0) break; // dead end: no matches down this road
+        }
+        for (size_t k = 0; k < cur.n && ret == 0; k++) {
+            if (glob_vec_push(&out, cur.v[k]) != 0) {
+                ret = GLOB_NOSPACE;
+                break;
+            }
+        }
+        glob_vec_free(&cur);
+        glob_vec_free(&next);
+    }
+
+done:
+    if (ret == GLOB_NOSPACE) {
+        if (!(flags & GLOB_APPEND)) {
+            glob_vec_free(&out);
+            pglob->gl_pathc = 0;
+            pglob->gl_pathv = NULL;
+        }
+        return GLOB_NOSPACE;
+    }
+    if (out.n == 0) {
+        glob_vec_free(&out);
+        if (flags & GLOB_NOCHECK) {
+            char lit[1024];
+            glob_unescape_to(pattern, lit, noescape);
+            pglob->gl_pathv = (char **)malloc(2 * sizeof(char *));
+            if (!pglob->gl_pathv) return GLOB_NOSPACE;
+            pglob->gl_pathv[0] = strdup(lit);
+            if (!pglob->gl_pathv[0]) {
+                free(pglob->gl_pathv);
+                pglob->gl_pathv = NULL;
+                return GLOB_NOSPACE;
+            }
+            pglob->gl_pathv[1] = NULL;
+            pglob->gl_pathc = 1;
+            pglob->gl_offs = 0;
+            return 0;
+        }
+        pglob->gl_pathc = 0;
+        pglob->gl_pathv = NULL;
+        pglob->gl_offs = 0;
+        return GLOB_NOMATCH;
+    }
+    pglob->gl_pathv = (char **)malloc((out.n + 1) * sizeof(char *));
+    if (!pglob->gl_pathv) {
+        glob_vec_free(&out);
+        pglob->gl_pathc = 0;
+        return GLOB_NOSPACE;
+    }
+    for (size_t i = 0; i < out.n; i++) pglob->gl_pathv[i] = out.v[i];
+    pglob->gl_pathv[out.n] = NULL;
+    pglob->gl_pathc = out.n;
+    pglob->gl_offs = 0;
+    free(out.v); // strings transfer to pglob
     return 0;
 }
 
