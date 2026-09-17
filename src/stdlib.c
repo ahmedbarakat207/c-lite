@@ -228,6 +228,10 @@ double strtod(const char *nptr, char **endptr) {
     return sign * val;
 }
 
+double atof(const char *nptr) {
+    return strtod(nptr, NULL);
+}
+
 __attribute__((weak)) char *itoa(int value, char *str, int base) {
     if (base < 2 || base > 36) {
         *str = '\0';
@@ -430,4 +434,18 @@ void __assert_fail(const char *expr, const char *file, int line, const char *fun
     fprintf(stderr, "Assertion failed: %s (%s: %s: %d)\n",
             expr ? expr : "", file ? file : "", func ? func : "", line);
     abort();
+}
+
+div_t div(int numer, int denom) {
+    div_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
+ldiv_t ldiv(long numer, long denom) {
+    ldiv_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
 }

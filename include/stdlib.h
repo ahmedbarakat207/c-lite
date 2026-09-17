@@ -11,6 +11,19 @@
 #define alloca(size) __builtin_alloca(size)
 #endif
 
+typedef struct {
+    int quot;
+    int rem;
+} div_t;
+
+typedef struct {
+    long quot;
+    long rem;
+} ldiv_t;
+
+div_t div(int numer, int denom);
+ldiv_t ldiv(long numer, long denom);
+
 void *malloc(size_t size);
 void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
@@ -23,6 +36,7 @@ unsigned long strtoul(const char *nptr, char **endptr, int base);
 long long strtoll(const char *nptr, char **endptr, int base);
 unsigned long long strtoull(const char *nptr, char **endptr, int base);
 double strtod(const char *nptr, char **endptr);
+double atof(const char *nptr);
 // char *itoa(int value, char *str, int base);
 
 void abort(void);

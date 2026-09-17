@@ -254,6 +254,65 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
                 format_num(&out, &rem, (uintptr_t)ptr, 16, 0, sizeof(uintptr_t) * 2, '0', 0, 0);
                 break;
             }
+            case 'f': {
+                double val = va_arg(ap, double);
+                int negative = 0;
+                if (val < 0.0) {
+                    negative = 1;
+                    val = -val;
+                }
+                int prec = (precision >= 0) ? precision : 6;
+                double rounder = 0.5;
+                for (int i = 0; i < prec; i++) rounder /= 10.0;
+                val += rounder;
+
+                unsigned long int_part = (unsigned long)val;
+                double frac_part = val - (double)int_part;
+
+                char fbuf[64];
+                char *fp = fbuf;
+                if (negative) *fp++ = '-';
+
+                char num_buf[32];
+                int pos = 0;
+                if (int_part == 0) {
+                    num_buf[pos++] = '0';
+                } else {
+                    unsigned long tmp = int_part;
+                    while (tmp > 0) {
+                        num_buf[pos++] = '0' + (tmp % 10);
+                        tmp /= 10;
+                    }
+                }
+                for (int i = pos - 1; i >= 0; i--) {
+                    *fp++ = num_buf[i];
+                }
+                if (prec > 0) {
+                    *fp++ = '.';
+                    for (int i = 0; i < prec; i++) {
+                        frac_part *= 10.0;
+                        int digit = (int)frac_part;
+                        if (digit > 9) digit = 9;
+                        *fp++ = '0' + digit;
+                        frac_part -= digit;
+                    }
+                }
+                *fp = '\0';
+
+                size_t slen = fp - fbuf;
+                int pad_count = (width > (int)slen) ? (width - (int)slen) : 0;
+                if (!left_align) {
+                    while (pad_count-- > 0 && rem > 1) { *out++ = ' '; rem--; }
+                }
+                for (size_t i = 0; i < slen && rem > 1; i++) {
+                    *out++ = fbuf[i];
+                    rem--;
+                }
+                if (left_align) {
+                    while (pad_count-- > 0 && rem > 1) { *out++ = ' '; rem--; }
+                }
+                break;
+            }
             default:
                 if (rem > 1) {
                     *out++ = *format;
